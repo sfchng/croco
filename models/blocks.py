@@ -111,6 +111,45 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+
+class AttentionH24(nn.Module):
+
+    def __init__(self, dim, rope=None, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., head_dim=64):
+        """
+        Increase the number of heads, but keeping the head_dim constant
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(dim, self.head_dim * self.num_heads * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(self.head_dim * self.num_heads, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.rope = rope   
+        
+    def forward(self, x, xpos):
+        B, N, C = x.shape
+
+        ## qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1,3) #(B,num_head,3,N,head_dim)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).transpose(1,3) #(B, num_head,3,N,head_dim)
+        q, k, v = [qkv[:,:,i] for i in range(3)]
+        # q,k,v = qkv.unbind(2)  # make torchscript happy (cannot use tensor as tuple)
+               
+        if self.rope is not None:
+            q = self.rope(q, xpos)
+            k = self.rope(k, xpos)
+               
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, self.num_heads*self.head_dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
@@ -128,6 +167,27 @@ class Block(nn.Module):
         x = x + self.drop_path(self.attn(self.norm1(x), xpos))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
+
+class BlockH24(nn.Module):
+
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, rope=None):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = AttentionH24(dim, rope=rope, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+
+        ## sfchng::: Figure out what is the mlp_ratio, Hemanth uses mlp_ratio = 2
+        mlp_hidden_dim = int(dim * mlp_ratio)  
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x, xpos):
+        x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
 
 class CrossAttention(nn.Module):
     
